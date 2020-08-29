@@ -1,0 +1,201 @@
+#!/usr/bin/ruby
+require 'gpi'
+require 'yaml'
+
+GPI.app_name = "amntr"
+GPI::CLU.init
+
+if ENV['HOME'] != '/root'
+  GPI.print "error: requires root user (sudo #{GPI.app_name})"
+  GPI.quit
+end
+
+GPI::CLU.use_command("m", 0..1, "")
+GPI::CLU.use_command("u", 0..1, "e")
+GPI::CLU.process_args
+
+HOME = ENV['LOGNAME']
+IGNOLIST = [ "sda" ]
+
+#        block device uuid      mount point
+#STAT = { "example" => "/mnt/example" }
+STAT = { "" => "" }
+
+STAT.each do |k,v|
+  Dir.mkdir(v) unless Dir.exist?(v)
+end
+
+# read block devices
+blk = BlockDevice.read_all
+
+blk.each do |b|
+
+  GPI.print "Skipping #{b.name}"
+  next if b.ignored?
+
+  b.partitions.each do |p|
+    if GPI::CLU.parameters.length > 0
+      p.process if GPI::CLU.parameters.include?(p.name)
+    else
+      p.process
+    end
+  end
+  if GPI::CLU.command == 'u' && GPI::CLU.check_option('e')
+    # eject ! powerdown device
+    b.eject if b.mounted_n == 0
+  end
+end
+
+
+
+###############################################################################
+BEGIN {
+
+class Partition
+  attr_accessor :name, :uuid, :mnt, :blk
+
+  def initialize(blk)
+    @blk = blk
+  end
+
+  def process
+    GPI.print "Processing '#{@name}'"
+    case GPI::CLU.command
+    when 'm'
+      unless mounted?
+        mount
+      end
+    when 'u'
+      if mounted?
+        unmount
+      end
+    end
+  end
+
+  def mount
+    if STAT.has_key?(@uuid)
+      @mnt = STAT[@uuid]
+      Dir.mkdir(@mnt) unless Dir.exist?(@mnt)
+      GPI.print "created dir #{@mnt}" unless Dir.exist?(@mnt)
+    else
+      i = 0
+      while Dir.exist?("/mnt/#{i}") do
+          i += 1
+      end
+      @mnt = "/mnt/#{i}"
+      Dir.mkdir(@mnt)
+      GPI.print "created dir #{@mnt}"
+    end
+    cmd = "mount /dev/#{@name} #{@mnt}"
+    GPI.print cmd
+    %x{ #{cmd} }
+    @blk.mounted_n += 1
+    GPI.print "finish."
+  end
+
+  def unmount
+    cmd = "umount #{@mnt}"
+    GPI.print cmd
+    %x{ #{cmd} }
+    @blk.mounted_n -= 1
+    GPI.print "finish."
+    Dir.rmdir(@mnt)
+    GPI.print "removed dir #{@mnt}"
+    @mnt = ""
+  end
+
+  def mounted?
+    @mnt != ""
+  end
+end
+
+class BlockDevice
+  attr_accessor :mounted_n
+  attr_reader :name, :partitions
+
+  def initialize(name)
+    @name = name
+    @partitions = Array.new
+    @ignore =  IGNOLIST.include?(name)
+    @mounted_n = 0
+  end
+
+  def eject
+    GPI.print "ejecting disk #{@name}."
+    %x{ udisksctl power-off --block-device /dev/#{@name} }
+    GPI.print "finish."
+  end
+
+  def add_partition(data)
+    p = Partition.new(self)
+    p.name = data[:name][2..-1]
+    p.uuid = data[:uuid]
+    p.mnt  = data[:mnt]
+    @mounted_n += 1 if p.mounted?
+    @partitions.push p
+  end
+
+  def ignored?
+    @ignore
+  end
+
+  def BlockDevice.read_all
+    positions = Array.new
+    blkdevs = Array.new
+    str = %x{ lsblk -f }
+    i = 0
+    k = 0
+    str.each_line do |l|
+      if i == 0
+        j = 0
+        b = -1
+        e = -1
+        l.each_char do |c|
+          if c == " "
+            if l[j+1] != " "
+              e = j
+            else
+              e = -1
+            end
+          else
+            b = j if b == -1 # set beginning
+            e = -1
+            if l.length == j+1
+              e = j
+            end
+          end
+          if b != -1 && e != -1
+            e -= 1
+            if str.length == j+1
+              positions.push b..-1
+            else
+              positions.push b..e
+            end
+            b = -1
+          end
+          j += 1
+        end
+      end
+      i += 1
+      next if i == 1 # no need to process line[0]
+      h = Hash.new
+      h[:name] = l[positions[0]].strip
+      #fstype = l[positions[1]].strip
+      #label = l[positions[2]].strip
+      h[:uuid] = l[positions[3]].strip
+      #fsavail = l[positions[4]].strip
+      #fuse = l[positions[5]].strip
+      h[:mnt] = l[positions[6]].strip
+
+      if h[:name].match? /\Asd[a-z]\z/
+        blkdevs.push BlockDevice.new(h[:name])
+      else
+        blkdevs.last.add_partition(h) unless blkdevs.last.ignored?
+      end
+
+    end
+    blkdevs
+  end
+
+end
+}
