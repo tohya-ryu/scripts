@@ -88,7 +88,8 @@ class Partition
     end
     cmd = "mount /dev/#{@name} #{@mnt}"
     GPI.print cmd
-    %x{ #{cmd} }
+    x = %x{ #{cmd} }
+    GPI.print x
     @blk.mounted_n += 1
     GPI.print "finish."
   end
@@ -96,7 +97,8 @@ class Partition
   def unmount
     cmd = "umount #{@mnt}"
     GPI.print cmd
-    %x{ #{cmd} }
+    x = %x{ #{cmd} }
+    GPI.print x
     @blk.mounted_n -= 1
     GPI.print "finish."
     Dir.rmdir(@mnt)
@@ -121,8 +123,10 @@ class BlockDevice
   end
 
   def eject
-    GPI.print "ejecting disk #{@name}."
-    %x{ udisksctl power-off --block-device /dev/#{@name} }
+    cmd = "udisksctl power-off --block-device /dev/#{@name}"
+    GPI.print cmd
+    x = %x{ cmd }
+    GPI.print x
     GPI.print "finish."
   end
 
