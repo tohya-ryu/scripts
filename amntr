@@ -1,327 +1,467 @@
 #!/usr/bin/ruby
-require 'gpi'
-require 'yaml'
+require 'optparse'
 
-$repeat = false
-
-GPI.app_name = "amntr"
-GPI::CLU.init
-
-if ENV['HOME'] != '/root'
-  GPI.print "error: requires root user (sudo #{GPI.app_name})"
-  GPI.quit
-end
-
-GPI::CLU.use_command("m", 0..1, "")
-GPI::CLU.use_command("u", 0..1, "ae")
-GPI::CLU.process_args
-
-HOME = ENV['LOGNAME']
-
-# ignore these block devices
+# ignore these block devices entirely
 IGNO_DEV = [ "sda" ]
 
-# encrypted partitions
-CRYPT_PART = { "mapper_name" => "uuid" }
-MAPPER = { "mapper_name" => "uuid" }
+# ignore these individual partitions
+IGNO_PART = [ ]
 
-# also ignore block devices with partitions having any of these uuids
-IGNO_PART = Array.new
+# only dismount these partitions with option -a
+PROT_PART = [ "uuid" ]
 
-# do not dismount home partitions without option -a
-HOME_UUID = [ "uuid" ]
+# mapper names for encrypted partitions
+CRYPT_MAP = { "uuid" => "mapper_name" }
 
-# chown 1000:1000 for all ext4 drives
-EXT4_CHOWN = [ "uuid" ]
-
-#        block device uuid      mount point
-STAT = { "uuid" => "path_to_mount_at" }
-
-# read block devices
-blk = BlockDevice.read_all
-
-blk.each do |b|
-
-  b.partitions.reverse! if GPI::CLU.command == 'u'
-
-  b.partitions.each do |p|
-    if GPI::CLU.parameters.length > 0
-      p.process if GPI::CLU.parameters.include?(p.name)
-    else
-      p.process
-    end
-  end
-  if GPI::CLU.command == 'u' && GPI::CLU.check_option('e')
-    # eject ! powerdown device
-    b.eject if b.mounted_n == 0
-  end
-  GPI.print "done"
-end
-
-# quick hack to accomodate freshly opened encrypted partitions
-if $repeat
-  GPI.print "repeat!"
-  blk = BlockDevice.read_all
-
-  blk.each do |b|
-
-    b.partitions.reverse! if GPI::CLU.command == 'u'
-
-    b.partitions.each do |p|
-      if GPI::CLU.parameters.length > 0
-        p.process if GPI::CLU.parameters.include?(p.name)
-      else
-        p.process
-      end
-    end
-    GPI.print "repeat done"
-  end
-end
+# static mount points
+STAT = { "uuid" => "mount_point_path" }
 
 
+
+amtr = Amntr.new
+amtr.run
 
 ###############################################################################
 BEGIN {
 
-class Partition
-  attr_accessor :name, :uuid, :mnt, :blk, :crypt, :mapper, :mapper_name, :home
+  class Amntr
+    attr_reader :block_devices, :options, :operation
+    attr_accessor :second_pass
 
-  def initialize(blk)
-    @blk = blk
-    @crypt = false
-    @mapper = false
-    @mapper_name = ""
-    @home = false
-  end
-
-  def process
-    GPI.print "Processing '#{@name}'"
-    case GPI::CLU.command
-    when 'm'
-      unless mounted?
-        mount
-      end
-    when 'u'
-      if mounted? || is_encrypted?
-        unmount
-      end
+    def initialize
+      @block_devices = Array.new
+      @options = Hash.new
+      @options[:mount] = false
+      @options[:unmount] = false
+      @options[:verbose] = false
+      @options[:all] = false
+      @options[:eject] = false
+      @args = nil
+      @gather_all = true
+      @second_pass = false
+      @operation = nil
     end
-  end
 
-  def mount
-    GPI.print "mounting #{@name}"
-    if STAT.has_key?(@uuid)
-      @mnt = STAT[@uuid]
-      Dir.mkdir(@mnt) unless Dir.exist?(@mnt)
-      GPI.print "created dir #{@mnt}" unless Dir.exist?(@mnt)
-    else
-      unless is_encrypted?
-        i = 0
-        while Dir.exist?("/mnt/#{i}") do
-            i += 1
+    def run
+      parse_options
+      if @options[:mount]
+        @operation = "mount/open"
+        gather_devices
+        @block_devices.each do |blkdev|
+          blkdev.partitions.each do |part|
+            part.mount_or_open
+          end
         end
-        @mnt = "/mnt/#{i}"
-        Dir.mkdir(@mnt)
-        GPI.print "created dir #{@mnt}"
-      end
-    end
-    if is_encrypted?
-      cmd = "cryptsetup status #{@mapper_name}"
-      GPI.print cmd
-      cmd_response = `#{cmd}`
-      if cmd_response.include? "is inactive"
-        GPI.print "opening encrypted partition"
-        cmd = "cryptsetup luksOpen /dev/#{@name} #{@mapper_name}"
-        GPI.print cmd
-        if system("#{cmd}")
-          @blk.mounted_n += 1
-          $repeat = true
+        if @second_pass
+          gather_devices
+          @block_devices.each do |blkdev|
+            blkdev.partitions.each do |part|
+              part.mount_or_open
+            end
+          end
         end
-      elsif cmd_response.include? "is active"
-        GPI.print "encrypted partition already active, skip opening"
-        @blk.mounted_n += 1
-      end
-    elsif is_mapper?
-      GPI.print "mounting encryption mapper"
-      cmd = "mount /dev/mapper/#{@mapper_name} #{@mnt}"
-      system("#{cmd}")
-      @blk.mounted_n += 1
-    else
-      cmd = "mount /dev/#{@name} #{@mnt}"
-      GPI.print cmd
-      system("#{cmd}")
-      @blk.mounted_n += 1
-    end
-    if EXT4_CHOWN.include?(@uuid)
-      cmd = "chown 1000:1000 #{@mnt}"
-      GPI.print cmd
-      system("#{cmd}")
-    end
-  end
-
-  def unmount
-    if @home && !GPI::CLU.check_option('a')
-      GPI.print "skipping home partition #{@name}"
-      return
-    end
-    if is_encrypted?
-      flag = false
-      @blk.partitions.each do |p|
-        if p.mapper && p.mapper_name == @mapper_name && !p.mounted?
-          flag = true
-          break
+      else # @options[:unmount]
+        @operation = "unmount/close"
+        gather_devices
+        @block_devices.each do |blkdev|
+          blkdev.partitions.reverse_each do |part|
+            part.unmount_or_close
+          end
+          if @options[:eject]
+            flag = true # it's ok to eject
+            blkdev.partitions.each do |part|
+              if part.mounted?
+                flag = false
+              end
+              if part.is_protected? && !@options[:all]
+                flag = false
+              end
+            end
+            if flag
+              blkdev.eject
+            end
+          end
         end
       end
-      if flag
-        cmd = "cryptsetup luksClose #{@mapper_name}"
-        GPI.print cmd
-        if system(cmd)
-          @blk.mounted_n -= 1
-          GPI.print "closed #{@mapper_name}"
-        end
-      end
-    else
-      cmd = "umount #{@mnt}"
-      GPI.print cmd
-      if system("#{cmd}")
-        GPI.print "dismounted #{@mnt}"
-        @blk.mounted_n -= 1
-        Dir.rmdir(@mnt)
-        GPI.print "removed dir #{@mnt}"
-        @mnt = ""
-      else
-        GPI.print "failed to dismount #{@mnt}"
-      end
     end
-  end
 
-  def mounted?
-    @mnt != ""
-  end
 
-  def is_mapper?
-    @mapper
-  end
+    private
 
-  def is_encrypted?
-    @crypt
-  end
-end
-
-class BlockDevice
-  attr_accessor :mounted_n, :home
-  attr_reader :name, :partitions
-
-  def initialize(name)
-    @name = name
-    @partitions = Array.new
-    @ignore =  IGNO_DEV.include?(name)
-    @home = false
-    @mounted_n = 0
-  end
-
-  def eject
-    GPI.print "ejecting disk #{@name}."
-    %x{ udisksctl power-off --block-device /dev/#{@name} }
-    GPI.print "finish."
-  end
-
-  def add_partition(data)
-    p = Partition.new(self)
-    p.name = data[:name][2..-1]
-    p.uuid = data[:uuid]
-    p.mnt  = data[:mnt]
-    p.home = true if HOME_UUID.include?(p.uuid)
-    @mounted_n += 1 if p.mounted?
-    CRYPT_PART.each do |k,v|
-      if p.uuid == v
-        p.crypt = true
-        p.mapper_name = k
-      end
-    end
-    MAPPER.each do |k,v|
-      if p.uuid == v
-        p.mapper = true
-        p.mapper_name = k
-      end
-    end
-    @partitions.push p
-  end
-
-  def ignored?
-    @ignore
-  end
-
-  def BlockDevice.read_all
-    dev_skip = false
-    positions = Array.new
-    blkdevs = Array.new
-    str = %x{ lsblk -f }
-    i = 0
-    k = 0
-    str.each_line do |l|
-      if i == 0
-        j = 0
-        b = -1
-        e = -1
-        l.each_char do |c|
-          if c == " "
-            if l[j+1] != " "
-              e = j
+    def gather_devices
+      curr_dev = nil
+      dev_skip = false
+      positions = Array.new
+      blkdevs = Array.new
+      str = `lsblk -f`
+      i = 0
+      k = 0
+      str.each_line do |l|
+        if i == 0
+          j = 0
+          b = -1
+          e = -1
+          l.each_char do |c|
+            if c == " "
+              if l[j+1] != " "
+                e = j
+              else
+                e = -1
+              end
             else
+              b = j if b == -1 # set beginning
               e = -1
+              if l.length == j+1
+                e = j
+              end
+            end
+            if b != -1 && e != -1
+              e -= 1
+              if str.length == j+1
+                positions.push b..-1
+              else
+                positions.push b..e
+              end
+              b = -1
+            end
+            j += 1
+          end
+        end
+        i += 1
+        next if i == 1 # no need to process line[0]
+        h = Hash.new
+        h[:name] = l[positions[0]].strip
+        h[:type] = l[positions[1]].strip
+        h[:label] = l[positions[2]].strip
+        h[:uuid] = l[positions[3]].strip
+        #h[:avail] = l[positions[4]].strip
+        #h[:use] = l[positions[5]].strip
+        h[:mnt] = l[positions[6]].strip
+
+        if h[:name].match? /\Asd[a-z]\z/
+          if (@gather_all || ARGV.include?(h[:name])) && 
+            !IGNO_DEV.include?(h[:name])
+
+            dev_skip = false
+            dev_found = false
+            @block_devices.each do |b|
+              if b.name == h[:name]
+                curr_dev = b
+                dev_found = true
+                break
+              end
+            end
+            unless dev_found
+              curr_dev = BlockDevice.new(self, h[:name])
+              @block_devices.push(curr_dev)
             end
           else
-            b = j if b == -1 # set beginning
-            e = -1
-            if l.length == j+1
-              e = j
-            end
+            puts "Skipping Block Device #{h[:name]}" if @options[:verbose]
+            dev_skip = true
           end
-          if b != -1 && e != -1
-            e -= 1
-            if str.length == j+1
-              positions.push b..-1
-            else
-              positions.push b..e
-            end
-            b = -1
-          end
-          j += 1
-        end
-      end
-      i += 1
-      next if i == 1 # no need to process line[0]
-      h = Hash.new
-      h[:name] = l[positions[0]].strip
-      #fstype = l[positions[1]].strip
-      #label = l[positions[2]].strip
-      h[:uuid] = l[positions[3]].strip
-      #fsavail = l[positions[4]].strip
-      #fuse = l[positions[5]].strip
-      h[:mnt] = l[positions[6]].strip
-
-      if h[:name].match? /\Asd[a-z]\z/
-        if IGNO_DEV.include?(h[:name])
-          GPI.print "Skipping #{h[:name]}"
-          dev_skip = true
         else
-          dev_skip = false
-        end
-
-        blkdevs.push BlockDevice.new(h[:name]) unless IGNO_DEV.
-          include?(h[:name])
-      else
-        unless dev_skip
-          GPI.print "Skipping Partition #{h[:name][2..-1]}" if IGNO_PART.
-            include?(h[:uuid])
-          blkdevs.last.add_partition(h) unless IGNO_PART.include?(h[:uuid])
+          unless dev_skip
+            if IGNO_PART.include?(h[:uuid])
+              if @options[:verbose]
+                puts "Skipping Partition #{h[:name][2..-1]}"
+              end
+            else
+              part_found = false
+              curr_dev.partitions.each do |p|
+                if p.uuid == h[:uuid]
+                  part_found = true
+                  break
+                end
+              end
+              unless part_found
+                  curr_dev.add_partition(Partition.new(curr_dev, h))
+              end
+            end
+          end
         end
       end
-
     end
-    blkdevs
+
+    def parse_options
+      optparse = OptionParser.new do |opts|
+        opts.banner = "Usage: amntr [devices...] -m|-u [options]"
+        opts.on_tail('-h', '--help', 'Display this screen') do
+          puts opts
+          exit
+        end
+        opts.on('-v', '--verbose', 'Verbose mode') do |arg|
+          @options[:verbose] = true
+        end
+        opts.on('-m', '--mount', Array, 'Mount partitions') do |arg|
+          @options[:mount] = true 
+        end
+        opts.on('-u', '--unmount', 'Unmount partitions') do |arg|
+          @options[:unmount] = true 
+        end
+        opts.on('-e', '--eject', 'Shut down devices') do |arg|
+          @options[:eject] = true
+        end
+        opts.on('-a', '--all',
+                'Also unmount/eject protected partitions') do |arg|
+          @options[:all] = true 
+        end
+      end
+      begin
+        optparse.parse!
+      rescue OptionParser::InvalidOption => e
+        puts e
+        puts ""
+        puts optparse
+        exit
+      end
+      if @options[:mount] && @options[:unmount]
+        puts "Invalid arguments: options -m and -u are mutually exclusive."
+        puts ""
+        puts optparse
+        exit
+      end
+      if !@options[:mount] && !@options[:unmount]
+        puts "Invalid arguments: requires either -m or -u option"
+        puts ""
+        puts optparse
+        exit
+      end
+      @gather_all = (ARGV.count == 0)
+    end
+
   end
 
-end
+  class BlockDevice
+    attr_reader :name, :partitions, :state
+
+    def initialize(state, name)
+      @state = state
+      @name = name
+      @partitions = Array.new
+    end
+
+    def add_partition(partition)
+      @partitions.push(partition)
+    end
+
+    def eject
+      puts "Attempting to eject /dev/#{@name}" if @state.options[:verbose]
+      cmd = "udisksctl power-off --block-device /dev/#{@name}"
+      puts cmd if @state.options[:verbose]
+      if system("#{cmd}")
+        puts "Shut down block device /dev/#{@name}"
+      else
+        puts "ERROR"
+        puts "Failed to shut down block device /dev/#{@name}"
+      end
+    end
+
+  end
+
+  class Partition
+    attr_reader :name, :label, :type, :uuid, :size, :used
+
+    def initialize(blkdev, data)
+      @blkdev = blkdev
+      @name = data[:name][2..-1]
+      @label = data[:label]
+      @type = data[:type]
+      @uuid = data[:uuid]
+      @prot = PROT_PART.include?(@uuid)
+      @size = nil
+      @used = nil
+      @crypt = (@type == "crypto_LUKS")
+      @mount_point = data[:mnt]
+      @mapper_name = nil
+      @mounted = false # or open if encrypted
+      @mapper = false
+      CRYPT_MAP.each do |k, v|
+        if @name == v
+          @mapper = true
+        end
+      end
+      if @crypt
+        if CRYPT_MAP.has_key?(@uuid)
+          @mapper_name = CRYPT_MAP[@uuid]
+        else
+          puts "ERROR"
+          puts "Missing entry in CRYPT_MAP for partition #{@name} " << 
+            "(uuid: #{@uuid})"
+          exit
+        end
+        cmd = "cryptsetup status #{@mapper_name}"
+        puts cmd if @blkdev.state.options[:verbose]
+        cmd_response = `#{cmd}`
+        if cmd_response.include?("is inactive")
+          if @blkdev.state.operation == "mount/open"
+            cmd = "cryptsetup luksOpen /dev/#{@name} #{@mapper_name}"
+            puts cmd if @blkdev.state.options[:verbose]
+            if system("#{cmd}")
+              @mounted = true
+              @blkdev.state.second_pass = true
+            end
+          end
+        elsif cmd_response.include?("is active")
+          @mounted = true
+        else
+          puts "ERROR"
+          puts "Failed to ascertain state of encrypted partition #{@name}"
+          exit
+        end
+      else
+        @mounted = !@mount_point.empty?
+        set_mount_point
+      end
+    end
+
+    def mount_or_open
+      if @mounted
+        if @blkdev.state.options[:verbose]
+          puts "Partition #{@name} is already mounted." 
+        end
+        return
+      else
+        puts "Attempting to mount #{@name}" if @blkdev.state.options[:verbose]
+      end
+      cmd = ""
+      if mapper?
+        cmd = "mount /dev/mapper/#{@name} #{@mount_point}"
+      else
+        cmd = "mount /dev/#{@name} #{@mount_point}"
+      end
+      puts cmd if @blkdev.state.options[:verbose]
+      if system("#{cmd}")
+        @mounted = true
+        cmd = "df -h --total"
+        puts cmd if @blkdev.state.options[:verbose]
+        str = `#{cmd}`
+        name = ""
+        if mapper?
+          name = "/dev/mapper/#{@name}"
+        else
+          name = "/dev/#{@name}"
+        end
+        str.each_line do |line|
+          ar = line.split(" ")
+          if ar[0] == name
+            puts "Mounted #{@name} (#{@label}) " <<
+              "[#{ar[2]}/#{ar[1]}] to #{@mount_point}"
+          end
+        end
+      else 
+        puts "ERROR"
+        puts "Failed to mount partition #{@name} to #{@mount_point}"
+        exit
+      end
+    end
+
+    def unmount_or_close
+      if is_protected? && !@blkdev.state.options[:all]
+        if @blkdev.state.options[:verbose]
+          puts "Skipping #{@name} because of protected status (-a to include)"
+        end
+        return
+      end
+      if @mounted
+        if encrypted?
+          if @blkdev.state.options[:verbose]
+            puts "Attempting to close #{@name} #{@mount_point}"
+          end
+          flag = false
+          @blkdev.partitions.each do |p|
+            if p.mapper? && p.name == @mapper_name && !p.mounted?
+              flag = true
+              break
+            end
+          end
+          if flag
+            cmd = "cryptsetup luksClose #{@mapper_name}"
+            puts cmd if @blkdev.state.options[:verbose]
+            if system("#{cmd}")
+              @mounted = false
+              puts "Closed encrypted partition #{@name}"
+            else
+              puts "ERROR"
+              puts "Failed to close encrypted partition #{@name}"
+            end
+          end
+        else
+          if @blkdev.state.options[:verbose]
+            puts "Attempting to unmount #{@name} #{@mount_point}"
+          end
+          cmd = "umount #{@mount_point}"
+          puts cmd if @blkdev.state.options[:verbose]
+          if system("#{cmd}")
+            @mounted = false
+            if Dir.rmdir(@mount_point)
+              if @blkdev.state.options[:verbose]
+                puts "Removed directory #{@mount_point}"
+              end
+            else
+              puts "ERROR"
+              puts "Failed to remove directory #{@mount_point}"
+            end
+            puts "Unmounted #{@name} #{@mount_point}"
+          else
+            puts "ERROR"
+            puts "Failed to unmount #{@name} #{@mount_point}"
+          end
+        end
+      end
+    end
+
+    def mounted?
+      @mounted
+    end
+
+    def mapper?
+      @mapper
+    end
+
+    def encrypted?
+      @crypt
+    end
+
+    def is_protected?
+      @prot
+    end
+
+    def set_mount_point
+      if @mount_point.empty?
+        puts "Set mount point for #{@name}" if @blkdev.state.options[:verbose]
+        if STAT.has_key?(@uuid)
+          @mount_point = STAT[@uuid]
+        else
+          i = 0
+          while Dir.exist?("/mnt/amtr#{i}") do
+            i += 1
+          end
+          @mount_point = "/mnt/amtr#{i}"
+        end
+        puts "> #{@mount_point}" if @blkdev.state.options[:verbose]
+        unless Dir.exist?(@mount_point)
+          if Dir.mkdir(@mount_point)
+            if @blkdev.state.options[:verbose]
+              puts "Created directory #{@mount_point}"
+            end
+
+            if @type == "ext4"
+              cmd = "chown 1000:1000 #{@mount_point}"
+              puts cmd if @blkdev.state.options[:verbose]
+              unless system("#{cmd}")
+                puts "ERROR"
+                puts "Failed to set owner of #{@mount_point}"
+              end
+            end
+          else
+            puts "ERROR"
+            puts "Unable to create directory #{@mount_point}"
+            exit
+          end
+        end
+      end
+    end
+
+  end
+
 }
