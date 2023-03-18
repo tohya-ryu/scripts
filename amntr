@@ -2,6 +2,8 @@
 require 'gpi'
 require 'yaml'
 
+$repeat = false
+
 GPI.app_name = "amntr"
 GPI::CLU.init
 
@@ -11,27 +13,36 @@ if ENV['HOME'] != '/root'
 end
 
 GPI::CLU.use_command("m", 0..1, "")
-GPI::CLU.use_command("u", 0..1, "e")
+GPI::CLU.use_command("u", 0..1, "ae")
 GPI::CLU.process_args
 
 HOME = ENV['LOGNAME']
-IGNOLIST = [ "sda" ]
+
+# ignore these block devices
+IGNO_DEV = [ "sda" ]
+
+# encrypted partitions
+CRYPT_PART = { "mapper_name" => "uuid" }
+MAPPER = { "mapper_name" => "uuid" }
+
+# also ignore block devices with partitions having any of these uuids
+IGNO_PART = Array.new
+
+# do not dismount home partitions without option -a
+HOME_UUID = [ "uuid" ]
+
+# chown 1000:1000 for all ext4 drives
+EXT4_CHOWN = [ "uuid" ]
 
 #        block device uuid      mount point
-#STAT = { "example" => "/mnt/example" }
-STAT = { "" => "" }
-
-STAT.each do |k,v|
-  Dir.mkdir(v) unless Dir.exist?(v)
-end
+STAT = { "uuid" => "path_to_mount_at" }
 
 # read block devices
 blk = BlockDevice.read_all
 
 blk.each do |b|
 
-  GPI.print "Skipping #{b.name}"
-  next if b.ignored?
+  b.partitions.reverse! if GPI::CLU.command == 'u'
 
   b.partitions.each do |p|
     if GPI::CLU.parameters.length > 0
@@ -44,6 +55,27 @@ blk.each do |b|
     # eject ! powerdown device
     b.eject if b.mounted_n == 0
   end
+  GPI.print "done"
+end
+
+# quick hack to accomodate freshly opened encrypted partitions
+if $repeat
+  GPI.print "repeat!"
+  blk = BlockDevice.read_all
+
+  blk.each do |b|
+
+    b.partitions.reverse! if GPI::CLU.command == 'u'
+
+    b.partitions.each do |p|
+      if GPI::CLU.parameters.length > 0
+        p.process if GPI::CLU.parameters.include?(p.name)
+      else
+        p.process
+      end
+    end
+    GPI.print "repeat done"
+  end
 end
 
 
@@ -52,10 +84,14 @@ end
 BEGIN {
 
 class Partition
-  attr_accessor :name, :uuid, :mnt, :blk
+  attr_accessor :name, :uuid, :mnt, :blk, :crypt, :mapper, :mapper_name, :home
 
   def initialize(blk)
     @blk = blk
+    @crypt = false
+    @mapper = false
+    @mapper_name = ""
+    @home = false
   end
 
   def process
@@ -66,67 +102,127 @@ class Partition
         mount
       end
     when 'u'
-      if mounted?
+      if mounted? || is_encrypted?
         unmount
       end
     end
   end
 
   def mount
+    GPI.print "mounting #{@name}"
     if STAT.has_key?(@uuid)
       @mnt = STAT[@uuid]
       Dir.mkdir(@mnt) unless Dir.exist?(@mnt)
       GPI.print "created dir #{@mnt}" unless Dir.exist?(@mnt)
     else
-      i = 0
-      while Dir.exist?("/mnt/#{i}") do
-          i += 1
+      unless is_encrypted?
+        i = 0
+        while Dir.exist?("/mnt/#{i}") do
+            i += 1
+        end
+        @mnt = "/mnt/#{i}"
+        Dir.mkdir(@mnt)
+        GPI.print "created dir #{@mnt}"
       end
-      @mnt = "/mnt/#{i}"
-      Dir.mkdir(@mnt)
-      GPI.print "created dir #{@mnt}"
     end
-    cmd = "mount /dev/#{@name} #{@mnt}"
-    GPI.print cmd
-    x = %x{ #{cmd} }
-    GPI.print x
-    @blk.mounted_n += 1
-    GPI.print "finish."
+    if is_encrypted?
+      cmd = "cryptsetup status #{@mapper_name}"
+      GPI.print cmd
+      cmd_response = `#{cmd}`
+      if cmd_response.include? "is inactive"
+        GPI.print "opening encrypted partition"
+        cmd = "cryptsetup luksOpen /dev/#{@name} #{@mapper_name}"
+        GPI.print cmd
+        if system("#{cmd}")
+          @blk.mounted_n += 1
+          $repeat = true
+        end
+      elsif cmd_response.include? "is active"
+        GPI.print "encrypted partition already active, skip opening"
+        @blk.mounted_n += 1
+      end
+    elsif is_mapper?
+      GPI.print "mounting encryption mapper"
+      cmd = "mount /dev/mapper/#{@mapper_name} #{@mnt}"
+      system("#{cmd}")
+      @blk.mounted_n += 1
+    else
+      cmd = "mount /dev/#{@name} #{@mnt}"
+      GPI.print cmd
+      system("#{cmd}")
+      @blk.mounted_n += 1
+    end
+    if EXT4_CHOWN.include?(@uuid)
+      cmd = "chown 1000:1000 #{@mnt}"
+      GPI.print cmd
+      system("#{cmd}")
+    end
   end
 
   def unmount
-    cmd = "umount #{@mnt}"
-    GPI.print cmd
-    x = %x{ #{cmd} }
-    GPI.print x
-    @blk.mounted_n -= 1
-    GPI.print "finish."
-    Dir.rmdir(@mnt)
-    GPI.print "removed dir #{@mnt}"
-    @mnt = ""
+    if @home && !GPI::CLU.check_option('a')
+      GPI.print "skipping home partition #{@name}"
+      return
+    end
+    if is_encrypted?
+      flag = false
+      @blk.partitions.each do |p|
+        if p.mapper && p.mapper_name == @mapper_name && !p.mounted?
+          flag = true
+          break
+        end
+      end
+      if flag
+        cmd = "cryptsetup luksClose #{@mapper_name}"
+        GPI.print cmd
+        if system(cmd)
+          @blk.mounted_n -= 1
+          GPI.print "closed #{@mapper_name}"
+        end
+      end
+    else
+      cmd = "umount #{@mnt}"
+      GPI.print cmd
+      if system("#{cmd}")
+        GPI.print "dismounted #{@mnt}"
+        @blk.mounted_n -= 1
+        Dir.rmdir(@mnt)
+        GPI.print "removed dir #{@mnt}"
+        @mnt = ""
+      else
+        GPI.print "failed to dismount #{@mnt}"
+      end
+    end
   end
 
   def mounted?
     @mnt != ""
   end
+
+  def is_mapper?
+    @mapper
+  end
+
+  def is_encrypted?
+    @crypt
+  end
 end
 
 class BlockDevice
-  attr_accessor :mounted_n
+  attr_accessor :mounted_n, :home
   attr_reader :name, :partitions
 
   def initialize(name)
     @name = name
     @partitions = Array.new
-    @ignore =  IGNOLIST.include?(name)
+    @ignore =  IGNO_DEV.include?(name)
+    @home = false
     @mounted_n = 0
   end
 
   def eject
-    cmd = "udisksctl power-off --block-device /dev/#{@name}"
-    GPI.print cmd
-    x = %x{ cmd }
-    GPI.print x
+    GPI.print "ejecting disk #{@name}."
+    %x{ udisksctl power-off --block-device /dev/#{@name} }
     GPI.print "finish."
   end
 
@@ -135,7 +231,20 @@ class BlockDevice
     p.name = data[:name][2..-1]
     p.uuid = data[:uuid]
     p.mnt  = data[:mnt]
+    p.home = true if HOME_UUID.include?(p.uuid)
     @mounted_n += 1 if p.mounted?
+    CRYPT_PART.each do |k,v|
+      if p.uuid == v
+        p.crypt = true
+        p.mapper_name = k
+      end
+    end
+    MAPPER.each do |k,v|
+      if p.uuid == v
+        p.mapper = true
+        p.mapper_name = k
+      end
+    end
     @partitions.push p
   end
 
@@ -144,6 +253,7 @@ class BlockDevice
   end
 
   def BlockDevice.read_all
+    dev_skip = false
     positions = Array.new
     blkdevs = Array.new
     str = %x{ lsblk -f }
@@ -192,9 +302,21 @@ class BlockDevice
       h[:mnt] = l[positions[6]].strip
 
       if h[:name].match? /\Asd[a-z]\z/
-        blkdevs.push BlockDevice.new(h[:name])
+        if IGNO_DEV.include?(h[:name])
+          GPI.print "Skipping #{h[:name]}"
+          dev_skip = true
+        else
+          dev_skip = false
+        end
+
+        blkdevs.push BlockDevice.new(h[:name]) unless IGNO_DEV.
+          include?(h[:name])
       else
-        blkdevs.last.add_partition(h) unless blkdevs.last.ignored?
+        unless dev_skip
+          GPI.print "Skipping Partition #{h[:name][2..-1]}" if IGNO_PART.
+            include?(h[:uuid])
+          blkdevs.last.add_partition(h) unless IGNO_PART.include?(h[:uuid])
+        end
       end
 
     end
