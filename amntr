@@ -1,17 +1,22 @@
 #!/usr/bin/ruby
 require 'optparse'
 
+VERSION = "3.1.0"
+
 # ignore these block devices entirely
 IGNO_DEV = [ "sda" ]
 
 # ignore these individual partitions
-IGNO_PART = [ ]
+IGNO_PART = [ "uuid" ]
 
 # only dismount these partitions with option -a
 PROT_PART = [ "uuid" ]
 
 # mapper names for encrypted partitions
 CRYPT_MAP = { "uuid" => "mapper_name" }
+
+# key files used to open encrypted devices
+CRYPT_KEY = { "uuid" => "key_file_path" }
 
 # static mount points
 STAT = { "uuid" => "mount_point_path" }
@@ -294,7 +299,13 @@ BEGIN {
         cmd_response = `#{cmd}`
         if cmd_response.include?("is inactive")
           if @blkdev.state.operation == "mount/open"
-            cmd = "cryptsetup luksOpen /dev/#{@name} #{@mapper_name}"
+            cmd = ""
+            if CRYPT_KEY.has_key?(@uuid)
+              cmd = "cryptsetup luksOpen /dev/#{@name} #{@mapper_name} " <<
+                "--key-file=#{CRYPT_KEY[@uuid]}"
+            else
+              cmd = "cryptsetup luksOpen /dev/#{@name} #{@mapper_name}"
+            end
             puts cmd if @blkdev.state.options[:verbose]
             if system("#{cmd}")
               @mounted = true
