@@ -1,7 +1,7 @@
 #!/usr/bin/ruby
 require 'optparse'
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 # ignore these block devices entirely
 IGNO_DEV = [ "sda" ]
@@ -253,7 +253,7 @@ BEGIN {
       puts "Attempting to eject /dev/#{@name}" if @state.options[:verbose]
       cmd = "udisksctl power-off --block-device /dev/#{@name}"
       puts cmd if @state.options[:verbose]
-      if system("#{cmd}")
+      if system(cmd)
         puts "Shut down block device /dev/#{@name}"
       else
         puts "ERROR"
@@ -294,20 +294,20 @@ BEGIN {
             "(uuid: #{@uuid})"
           exit
         end
-        cmd = "cryptsetup status #{@mapper_name}"
+        cmd = "sudo cryptsetup status #{@mapper_name}"
         puts cmd if @blkdev.state.options[:verbose]
         cmd_response = `#{cmd}`
         if cmd_response.include?("is inactive")
           if @blkdev.state.operation == "mount/open"
             cmd = ""
             if CRYPT_KEY.has_key?(@uuid)
-              cmd = "cryptsetup luksOpen /dev/#{@name} #{@mapper_name} " <<
+              cmd = "sudo cryptsetup luksOpen /dev/#{@name} #{@mapper_name} " <<
                 "--key-file=#{CRYPT_KEY[@uuid]}"
             else
-              cmd = "cryptsetup luksOpen /dev/#{@name} #{@mapper_name}"
+              cmd = "sudo cryptsetup luksOpen /dev/#{@name} #{@mapper_name}"
             end
             puts cmd if @blkdev.state.options[:verbose]
-            if system("#{cmd}")
+            if system(cmd)
               @mounted = true
               @blkdev.state.second_pass = true
             end
@@ -336,12 +336,12 @@ BEGIN {
       end
       cmd = ""
       if mapper?
-        cmd = "mount /dev/mapper/#{@name} #{@mount_point}"
+        cmd = "sudo mount /dev/mapper/#{@name} #{@mount_point}"
       else
-        cmd = "mount /dev/#{@name} #{@mount_point}"
+        cmd = "sudo mount /dev/#{@name} #{@mount_point}"
       end
       puts cmd if @blkdev.state.options[:verbose]
-      if system("#{cmd}")
+      if system(cmd)
         @mounted = true
         cmd = "df -h --total"
         puts cmd if @blkdev.state.options[:verbose]
@@ -386,9 +386,9 @@ BEGIN {
             end
           end
           if flag
-            cmd = "cryptsetup luksClose #{@mapper_name}"
+            cmd = "sudo cryptsetup luksClose #{@mapper_name}"
             puts cmd if @blkdev.state.options[:verbose]
-            if system("#{cmd}")
+            if system(cmd)
               @mounted = false
               puts "Closed encrypted partition #{@name}"
             else
@@ -400,19 +400,27 @@ BEGIN {
           if @blkdev.state.options[:verbose]
             puts "Attempting to unmount #{@name} #{@mount_point}"
           end
-          cmd = "umount #{@mount_point}"
+          cmd = "sudo umount #{@mount_point}"
           puts cmd if @blkdev.state.options[:verbose]
-          if system("#{cmd}")
+          if system(cmd)
             @mounted = false
-            if Dir.rmdir(@mount_point)
-              if @blkdev.state.options[:verbose]
-                puts "Removed directory #{@mount_point}"
+            unless @mount_point == "/" || @mount_point == "./" || 
+                @mount_point.include?("..")
+              cmd = "sudo rm -r #{@mount_point}"
+              puts cmd if @blkdev.state.options[:verbose]
+              if system(cmd)
+                if @blkdev.state.options[:verbose]
+                  puts "Removed directory #{@mount_point}"
+                end
+              else
+                puts "ERROR"
+                puts "Failed to remove directory #{@mount_point}"
               end
+              puts "Unmounted #{@name} #{@mount_point}"
             else
               puts "ERROR"
-              puts "Failed to remove directory #{@mount_point}"
+              puts "Mount point #{@mount_point} includes illegal pattern"
             end
-            puts "Unmounted #{@name} #{@mount_point}"
           else
             puts "ERROR"
             puts "Failed to unmount #{@name} #{@mount_point}"
@@ -451,15 +459,17 @@ BEGIN {
         end
         puts "> #{@mount_point}" if @blkdev.state.options[:verbose]
         unless Dir.exist?(@mount_point)
-          if Dir.mkdir(@mount_point)
+          cmd = "sudo mkdir #{@mount_point}"
+          puts cmd if @blkdev.state.options[:verbose]
+          if system(cmd)
             if @blkdev.state.options[:verbose]
               puts "Created directory #{@mount_point}"
             end
 
             if @type == "ext4"
-              cmd = "chown 1000:1000 #{@mount_point}"
+              cmd = "sudo chown 1000:1000 #{@mount_point}"
               puts cmd if @blkdev.state.options[:verbose]
-              unless system("#{cmd}")
+              unless system(cmd)
                 puts "ERROR"
                 puts "Failed to set owner of #{@mount_point}"
               end
