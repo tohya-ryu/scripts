@@ -1,0 +1,199 @@
+#!/usr/bin/ruby
+require 'optparse'
+
+VERSION = "1.0.0"
+
+# local backup directory
+BACKUP_DIR = "/home/user/backup/"
+
+# encryption key
+CRYPT_KEY = "/home/user/key"
+
+# remote locations, crypt:true encrypts archive before transfer
+REMOTE = {
+  "key" => { dest: "user@host:path/",
+             crypt: true 
+  },
+}
+
+script = Main.new
+script.run
+
+###############################################################################
+BEGIN {
+
+  class Main
+    attr_reader :options
+
+    def initialize
+      @options = Hash.new
+      @options[:crypt] = false
+      @options[:remote] = false
+      @options[:verbose] = false
+      @args = nil
+      @remote = Array.new
+    end
+
+    def run
+      parse_options
+      ARGV.each do |arg|
+        if File.exist?(arg)
+          unless /\A[.|\/]+\z/.match?(arg)
+            archiv = Archive.new(arg, self)
+            archiv.create
+            archiv.encrypt if @options[:crypt]
+            if @options[:remote]
+              @remote.each do |location|
+                archiv.push(location)
+              end
+            end
+            archiv.move
+          else
+            puts "ERROR"
+            puts "Invalid argument #{arg}"
+          end
+        else
+          puts "ERROR"
+          puts "File/Directory #{arg} not found"
+        end
+      end
+    end
+
+    private
+
+    def parse_options
+      optparse = OptionParser.new do |opts|
+        opts.banner = "Usage: rbackup [files...] [options]"
+        opts.on_tail('-h', '--help', 'Display this screen') do
+          puts opts
+          exit
+        end
+        opts.on('-v', '--verbose', 'Verbose mode') do
+          @options[:verbose] = true
+        end
+        opts.on('-c', '--encrypt', 'Encrypt archive') do
+          @options[:crypt] = true
+        end
+        opts.on('-r', '--remote [x,y,z]', Array,  'Remote locations') do |list|
+          @options[:remote] = true
+          if list.nil?
+            REMOTE.each_key do |key|
+              @remote.push(REMOTE[key])
+            end
+          else
+            list.each do |key|
+              if REMOTE.has_key?(key)
+                @remote.push(REMOTE[key])
+              else
+                puts "ERROR"
+                puts "#{key} is not a key in REMOTE"
+                exit
+              end
+            end
+          end
+        end
+      end
+      begin
+        optparse.parse!
+      rescue OptionParser::InvalidOption => e
+        puts e
+        puts ""
+        puts optparse
+        exit
+      end
+      if ARGV.count == 0
+        puts optparse
+        exit
+      end
+      @remote.sort_by! do |e| 
+        if e[:crypt]
+          1
+        else
+          0
+        end
+      end
+    end
+
+  end
+
+  class Archive
+
+    def initialize(src, state)
+      @state = state
+      @src = src
+      @src_clean = src
+      @src_clean = @src_clean[0..-2] if src[-1] == "/"
+      @name = "#{@src_clean}.tar.bz2"
+      @encrypted = false
+    end
+
+    def move
+      dir = backup_dir
+      cmd = "mv #{@name} #{dir}"
+      puts cmd if @state.options[:verbose]
+      if system(cmd)
+        puts "Moved #{@name} to #{dir}"
+      else
+        puts "ERROR"
+        puts "Failed to move #{@name} to #{dir}"
+      end
+    end
+
+    def push(location)
+      encrypt if location[:crypt]
+      cmd = "scp #{@name} #{location[:dest]}"
+      puts cmd if @state.options[:verbose]
+      unless system(cmd)
+        puts "ERROR"
+        puts "Failed to push archive to #{location[:dest]}"
+      else
+        puts "Pushed #{@name} to #{location[:dest]}"
+      end
+    end
+
+    def create
+      cmd = "tar cjf #{@name} #{@src}"
+      puts cmd if @state.options[:verbose]
+      unless system(cmd)
+        puts "ERROR"
+        puts "Failed to create archive #{@name}"
+        exit
+      else
+        puts "Created #{@name}"
+      end
+    end
+
+    def encrypt
+      return if @encrypted
+      # copy archive to BACKUP_DIR before encryption
+      dir = backup_dir
+      cmd = "cp #{@name} #{dir}"
+      puts cmd if @state.options[:verbose]
+      if system(cmd)
+        puts "Copied #{@name} to #{dir}"
+      else
+        puts "ERROR"
+        puts "Failed to copy #{@name} to #{dir}"
+      end
+      cmd = "ccrypt -e --keyfile #{CRYPT_KEY} #{@name}"
+      if system(cmd)
+        puts "Encrypted #{@name}"
+        @name = @name << ".cpt"
+        @encrypted = true
+      else
+        puts "ERROR"
+        puts "Failed to encrypt archive #{@name}"
+      end
+    end
+
+    private
+
+    def backup_dir
+      dir = BACKUP_DIR
+      dir = dir << "/" unless BACKUP_DIR[-1] == "/"
+      dir
+    end
+
+  end
+
+}
