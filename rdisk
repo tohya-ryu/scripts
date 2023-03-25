@@ -179,7 +179,7 @@ BEGIN {
                 end
               end
               unless part_found
-                  curr_dev.add_partition(Partition.new(curr_dev, h))
+                curr_dev.add_partition(Partition.new(curr_dev, h))
               end
             end
           end
@@ -325,6 +325,20 @@ BEGIN {
       end
     end
 
+    def root_owner_to_user_owner
+      cmd = "stat -c \"%U:%G\" #{@mount_point}"
+      puts cmd if @blkdev.state.options[:verbose]
+      owner_group = `#{cmd}`
+      if owner_group.include?("root:root")
+        cmd = "sudo chown 1000:1000 #{@mount_point}"
+        puts cmd if @blkdev.state.options[:verbose]
+        unless system(cmd)
+          puts "ERROR"
+          puts "Failed to set owner of #{@mount_point}"
+        end
+      end
+    end
+
     def mount_or_open
       if @mounted
         if @blkdev.state.options[:verbose]
@@ -342,6 +356,9 @@ BEGIN {
       end
       puts cmd if @blkdev.state.options[:verbose]
       if system(cmd)
+        if @type == "ext4"
+          root_owner_to_user_owner
+        end
         @mounted = true
         cmd = "df -h --total"
         puts cmd if @blkdev.state.options[:verbose]
@@ -452,10 +469,10 @@ BEGIN {
           @mount_point = STAT[@uuid]
         else
           i = 0
-          while Dir.exist?("/mnt/amtr#{i}") do
+          while Dir.exist?("/mnt/auto#{i}") do
             i += 1
           end
-          @mount_point = "/mnt/amtr#{i}"
+          @mount_point = "/mnt/auto#{i}"
         end
         puts "> #{@mount_point}" if @blkdev.state.options[:verbose]
         unless Dir.exist?(@mount_point)
@@ -467,12 +484,7 @@ BEGIN {
             end
 
             if @type == "ext4"
-              cmd = "sudo chown 1000:1000 #{@mount_point}"
-              puts cmd if @blkdev.state.options[:verbose]
-              unless system(cmd)
-                puts "ERROR"
-                puts "Failed to set owner of #{@mount_point}"
-              end
+              root_owner_to_user_owner
             end
           else
             puts "ERROR"
