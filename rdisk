@@ -1,7 +1,7 @@
 #!/usr/bin/ruby
 require 'optparse'
 
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 
 # ignore these block devices entirely
 IGNO_DEV = [ "sda" ]
