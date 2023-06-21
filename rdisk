@@ -137,11 +137,18 @@ BEGIN {
         h = Hash.new
         h[:name] = l[positions[0]].strip
         h[:type] = l[positions[1]].strip
-        h[:label] = l[positions[2]].strip
-        h[:uuid] = l[positions[3]].strip
-        #h[:avail] = l[positions[4]].strip
-        #h[:use] = l[positions[5]].strip
-        h[:mnt] = l[positions[6]].strip
+        h[:label] = l[positions[3]].strip
+        h[:uuid] = l[positions[4]].strip
+        #h[:avail] = l[positions[5]].strip
+        #h[:use] = l[positions[6]].strip
+        h[:mnt] = l[positions[7]].strip
+
+=begin DEV_DEBUG
+        if @options[:verbose]
+          puts "Read line:"
+          puts "#{h[:name]} - #{h[:type]} - #{h[:label]} - #{h[:uuid]} - #{h[:mnt]}"
+        end
+=end
 
         if h[:name].match? /\Asd[a-z]\z/
           if (@gather_all || ARGV.include?(h[:name])) && 
