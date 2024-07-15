@@ -21,8 +21,6 @@ CRYPT_KEY = { "uuid" => "key_file_path" }
 # static mount points
 STAT = { "uuid" => "mount_point_path" }
 
-
-
 amtr = Amntr.new
 amtr.run
 
@@ -142,6 +140,8 @@ BEGIN {
         #h[:avail] = l[positions[5]].strip
         #h[:use] = l[positions[6]].strip
         h[:mnt] = l[positions[7]].strip
+
+        next if h[:name].include?("loop")
 
 =begin DEV_DEBUG
         if @options[:verbose]
